@@ -9,8 +9,8 @@ An ROV (Remotely Operated Vehicle) control system built in Python.
 
 ## Project Structure
 ```
-├── controller1.py    # Controller input handler
-├── controller2.py    # Controller input handler
+├── controller_server_updated.py    # Controller input handler
+├── example_cleint.py    # Example server
 └── .gitignore
 ```
 
