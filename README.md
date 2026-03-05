@@ -8,23 +8,23 @@ An ROV (Remotely Operated Vehicle) control system built in Python.
 - Real-time input handling
 
 ## Project Structure
-`
+```
 ├── controller1.py    # Controller input handler
 ├── controller2.py    # Controller input handler
 └── .gitignore
-`
+```
 
 ## Setup
 1. Clone the repo
-`ash
+`bash
 git clone https://github.com/RG1579/hydrobotics.git
 `
 2. Install dependencies
-`ash
+`bash
 pip install -r requirements.txt
 `
 3. Run the controller
-`ash
+`bash
 python controller1.py
 `
 
