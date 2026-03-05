@@ -1,4 +1,4 @@
-﻿# Hydrobotics
+# Hydrobotics
 
 An ROV (Remotely Operated Vehicle) control system built in Python.
 
