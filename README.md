@@ -1,32 +1,101 @@
-# Hydrobotics
+# Hydrobotics ROV — sensor fusion and control
 
-An ROV (Remotely Operated Vehicle) control system built in Python.
+Orientation estimation and pilot control software for a 6-DOF underwater ROV, written for Team Bath Hydrobotics.
 
-## Features
-- ROV controller input processing
-- Underwater vehicle control interface
-- Real-time input handling
+The core of the repo is an Error-State Kalman Filter that fuses two IMUs with different characteristics: a BNO085 providing an absolute fused quaternion at 50 Hz, and an ICM-20948 providing raw gyro at 200 Hz. The filter estimates ICM gyro bias online rather than assuming it constant, so the high-rate output stays locked to the absolute reference instead of drifting between updates.
 
-## Project Structure
+![IMU fusion output](docs/imu_fusion.png)
+
+## Why this architecture
+
+The BNO085 alone caps the update rate at 50 Hz and gives no visibility into estimate confidence. Running from raw sensors alone means rebuilding magnetometer handling that the BNO085 already does well. Cascading the two gets high-rate output while keeping an absolute reference, and makes gyro bias observable.
+
+Sensor selection followed the same logic. A second BNO-family device would share magnetic interference and drift characteristics with the BNO085: both headings wrong by a similar amount at the same time is not redundancy. A BMI088 offers good low-drift raw output but carries no magnetometer, which would cost absolute yaw reference. The ICM-20948 gives raw 9-axis output, complementing the BNO085 rather than duplicating it.
+
 ```
-├── controller_server_updated.py    # Controller input handler
-├── example_cleint.py    # Example server
-└── .gitignore
+ICM-20948 gyro  ──200 Hz──▶  PREDICT  ─┐
+                                        ├──▶  state: quaternion + gyro bias  ──▶  6-DOF state vector
+BNO085 quaternion ──50 Hz──▶  CORRECT  ─┘
+                                             bias fed back into predict
 ```
 
-## Setup
-1. Clone the repo
-`bash
-git clone https://github.com/RG1579/hydrobotics.git
-`
-2. Install dependencies
-`bash
+The accelerometer bypasses the filter entirely — the BNO085 already fuses it for levelling. It is gravity-compensated, rotated to world frame using the fused attitude, and integrated separately for linear velocity.
+
+A Bar10 pressure sensor feeds a small 1-D Kalman filter for depth and vertical velocity, which is blended into the state vector when readings are fresh.
+
+## Running it
+
+No hardware required: mock sensor models with a known injected gyro bias let the full pipeline run anywhere.
+
+```bash
 pip install -r requirements.txt
-`
-3. Run the controller
-`bash
-python controller1.py
-`
 
-## Disclaimer
-For educational and research purposes only.
+# simulated sensors, 60 seconds, generates a plot
+python3 imu_fusion.py --mock --duration 60 --plot
+
+# real sensors over I2C
+python3 imu_fusion.py --rate 50 --icm-rate 200 --plot
+
+# sensors bridged through an STM32 over UART
+python3 imu_fusion.py --stm32 /dev/ttyUSB0 --plot
+```
+
+Every run writes a CSV log and can render a diagnostic plot covering orientation, per-axis error, bias estimates, magnetometer calibration state, covariance trace and the divergence watchdog.
+
+## Validation
+
+Against a simulated IMU with an injected gyro bias of `[0.8, -0.5, 0.4]` deg/s unknown to the filter, the estimate converges to within 0.08 deg/s on all three axes in roughly 25 seconds from a cold start.
+
+Run it yourself:
+
+```bash
+python3 imu_fusion.py --mock --duration 300 --plot --no-bias-load --no-bias-save
+```
+
+The `--no-bias-load` flag matters: without it the filter starts from a previously saved estimate rather than from zero.
+
+## Known limitations
+
+Both of these are visible in the diagnostic plot and are open items:
+
+**Bias estimate oscillates at the motion frequency.** Rather than settling, the estimate cycles by roughly ±0.2 deg/s around the correct value, in step with the input motion. The likely cause is the first-order quaternion integration in the prediction step: its truncation error scales with the square of angular rate and timestep, so under periodic motion the error is periodic, and the bias state is the only free parameter available to absorb it. Raising `--icm-rate` should shrink it if this diagnosis is right.
+
+**Covariance collapses too early.** The trace falls by two orders of magnitude within five seconds while the bias estimate is still moving, meaning the filter becomes confident before it has genuinely converged. `Q_BIAS` is likely set too low.
+
+Validation is against simulated sensors. The hardware arrived late in the project, after the filter was written, so bench testing against the real ICM and BNO is the natural next step.
+
+## Design notes
+
+**Magnetometer trust timeout.** Yaw is normally excluded from the correction until the BNO085 reports adequate magnetometer calibration. But an ROV sitting near thrusters and a steel frame can stay uncalibrated indefinitely, and yaw gyro bias is only observable through that correction. Past a timeout the filter trusts yaw anyway with inflated measurement noise, rather than leaving yaw unobserved forever.
+
+**Complementary filter baseline.** A simple complementary filter runs alongside the ESKF and is logged for comparison. It exists to check the added complexity is justified rather than assumed. Note its `ALPHA` is applied per update and is not timestep-aware, so it is only meaningful at a fixed rate.
+
+**Joseph-form covariance update** for numerical stability, and a watchdog that flags sustained divergence between the fused estimate and the BNO085 reference.
+
+## Repository layout
+
+```
+imu_fusion.py                ESKF, depth filter, state vector, logging and plotting
+controller_server_updated.py Pilot input → 6-DOF velocity vector → TCP server
+example_client.py            Minimal client for testing the control link
+requirements.txt
+docs/                        Diagnostic plots and diagrams
+```
+
+## Pilot control
+
+Controller axes map to a 6-DOF body-frame velocity vector `[X, Y, Z, RX, RY, RZ]`, with deadzone filtering and per-axis inversion, packed as length-prefixed float32 and streamed over TCP at 50 Hz. Axis indices vary by controller and operating system, so the mapping constants at the top of the file may need adjusting, the startup printout lists available axes and buttons.
+
+## Hardware
+
+| Component | Role |
+|---|---|
+| BNO085 | Absolute orientation, internally fused, 50 Hz |
+| ICM-20948 | Raw gyro and accelerometer, 200 Hz |
+| Bar10 (MS5837) | Pressure and depth, 20 Hz |
+| Jetson Orin Nano | Onboard compute |
+| STM32 | Optional sensor bridge over UART |
+
+## Licence
+
+MIT.
