@@ -1,0 +1,28 @@
+numpy>=1.24
+
+# Plotting (--plot)
+matplotlib>=3.7
+
+# Pilot control server
+pygame>=2.5
+
+# STM32 UART bridge (--stm32)
+pyserial>=3.5
+
+# ---------------------------------------------------------------
+# Hardware-only. Not needed for mock mode; the code falls back to
+# simulated sensors if these are missing. Linux / Raspberry Pi OS
+# or Jetson only — they depend on I2C libraries unavailable on
+# Windows and macOS.
+# ---------------------------------------------------------------
+
+# BNO085 over I2C
+# adafruit-circuitpython-bno08x>=1.1
+# adafruit-blinka>=8.0
+
+# ICM-20948 over I2C
+# icm20948>=0.0.2
+
+# Bar10 / MS5837 depth sensor — not on PyPI, install from source:
+#   git clone https://github.com/bluerobotics/ms5837-python
+#   cd ms5837-python && pip install .
