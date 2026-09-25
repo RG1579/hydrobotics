@@ -672,9 +672,18 @@ class MockICM20948:
         ay =  math.cos(p) * math.sin(r) * g + random.gauss(0, 0.05)
         az =  math.cos(p) * math.cos(r) * g + random.gauss(0, 0.05)
 
-        gx = 0.3*15*math.cos(0.3*t)      + self._BIAS[0] + random.gauss(0, 0.3)
-        gy = 0.2*10*math.cos(0.2*t+0.5)  + self._BIAS[1] + random.gauss(0, 0.3)
-        gz = 0.1*30*math.cos(0.1*t)      + self._BIAS[2] + random.gauss(0, 0.3)
+        dphi = 0.3*15*math.cos(0.3*t)          # Euler angle rates, deg/s
+        dth  = 0.2*10*math.cos(0.2*t + 0.5)
+        dpsi = 0.1*30*math.cos(0.1*t)
+        
+        # a gyro measures body rates, not Euler angle rates (ZYX convention)
+        wx = dphi - dpsi*math.sin(p)
+        wy = dth*math.cos(r) + dpsi*math.cos(p)*math.sin(r)
+        wz = -dth*math.sin(r) + dpsi*math.cos(p)*math.cos(r)
+        
+        gx = wx + self._BIAS[0] + random.gauss(0, 0.3)
+        gy = wy + self._BIAS[1] + random.gauss(0, 0.3)
+        gz = wz + self._BIAS[2] + random.gauss(0, 0.3)
 
         return ax, ay, az, gx, gy, gz
 
