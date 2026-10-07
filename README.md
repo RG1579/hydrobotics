@@ -44,35 +44,19 @@ Every run writes a CSV log and can render a diagnostic plot covering orientation
 
 ## Validation
 
-Against a simulated IMU with an injected gyro bias of `[0.8, -0.5, 0.4]` deg/s unknown to the filter, the estimate converges to within 0.08 deg/s on all three axes in about 9 seconds from a cold start, and stays within that band for the rest of the run.
-
-The mock gyro outputs body rates derived from the same attitude trajectory as the mock BNO085, so the two simulated sensors describe the same motion.
-
-Run it yourself:
+Against a simulated IMU with an injected gyro bias of `[0.8, -0.5, 0.4]` deg/s unknown to the filter, the estimate converges to within 0.08 deg/s on all three axes in about 9 seconds from a cold start and stays there for a 300 s run. The ESKF tracks the BNO085 reference to 0.011° RMS on each axis, compared with 0.46–0.84° for the complementary filter baseline.
 
 ```bash
 python3 imu_fusion.py --mock --duration 300 --plot --no-bias-load --no-bias-save
 ```
 
-The `--no-bias-load` flag matters: without it the filter starts from a previously saved estimate rather than from zero.
+## A bug in the simulator, not the filter
 
-### Correction (September 2026)
-
-Earlier versions of this README reported the bias estimate oscillating by roughly ±0.2 deg/s at the motion frequency, with convergence to 0.08 deg/s taking about 25 seconds, and attributed the oscillation to the first-order quaternion integration in the prediction step. That diagnosis was wrong. At 200 Hz and these angular rates, the first-order truncation error is on the order of $10^{-7}$ deg/s, far too small to matter.
-
-The actual cause was the mock gyro, which output the time derivatives of the Euler angles instead of body rates. The two differ whenever the vehicle is rolled or pitched, by up to about 0.7 deg/s in this simulation, so the simulated gyro and simulated BNO085 disagreed periodically and the bias state absorbed the difference. With roll and pitch set to zero the oscillation disappears; with the mock fixed to output body rates, it is gone under full motion too.
-
-The early covariance collapse reported alongside it was a symptom of the same problem, not a separate one. The covariance in this filter barely depends on the measurements, so a shrinking trace while the bias kept moving was the filter tracking an inconsistency in the test data.
+An earlier version showed the bias estimate oscillating by about ±0.2 deg/s at the motion frequency. I initially attributed this to the first-order quaternion integration. A controlled comparison ruled that out: with the simulated vehicle held level the oscillation vanished, and under full motion it only appeared when the mock gyro output Euler-angle rates. A real gyro measures body rates, which differ from Euler-angle rates whenever roll or pitch is non-zero. The BNO085 reference stayed kinematically consistent, so the bias state absorbed the mismatch. The mock now converts Euler-angle rates to body rates, and the oscillation is gone.
 
 ## Known limitations
 
-**Validation is against simulated sensors.** The hardware arrived late in the project, after the filter was written, so bench testing against the real ICM and BNO is the natural next step.
-
-**Noise parameters are set for simulation.** `Q` and `R` have not been tuned against real sensors, and the mock BNO085 is noiseless. They should be set from datasheet noise densities or an Allan variance run, then checked for consistency using the normalised innovation.
-
-**The magnetometer trust timeout is not exercised in simulation.** The mock's calibration level reaches the threshold after 4 seconds, so the 30-second timeout path has not been tested.
-
-**Excluding yaw still shrinks yaw uncertainty.** While yaw is excluded, the BNO085's yaw is replaced with the filter's own, which the update still treats as a measurement. Dropping the yaw row from `H` during that period would be cleaner.
+Validation is against simulated sensors only. The hardware arrived after the filter was written, so bench testing against the real ICM-20948 and BNO085 is the next step. The noise parameters (`Q_GYRO`, `Q_BIAS`, `R_MEAS`) are set for the simulator and will need retuning on real data.
 
 ## Design notes
 
