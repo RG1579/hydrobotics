@@ -9,6 +9,13 @@ Usage:
   python3 imu_fusion.py --mock --duration 30 --plot
   python3 imu_fusion.py --rate 50 --icm-rate 200 --plot
   python3 imu_fusion.py --stm32 /dev/ttyUSB0 --plot
+
+Frames and units used everywhere below:
+  quaternions are [w, x, y, z], body -> world, world z points up
+  gyro in deg/s at the sensor interface, rad/s inside the ESKF
+  accel in m/s^2 (specific force, reads about +9.81 on z when level and still)
+  depth is positive down, so depth-rate is flipped before it meets the
+  up-positive state vector
 """
 
 import argparse
@@ -26,32 +33,43 @@ import numpy as np
 # no smbus2/fcntl on windows
 _FORCE_MOCK = platform.system() == "Windows"
 
+# Hardware libraries. If one is missing we only fall back to a mock when
+# --mock is given (or on Windows). Falling back silently on the robot would
+# mean running the filter on simulated data without noticing.
+#
+# Note: adafruit_bno08x has no BNO_REPORT_CALIBRATION_STATUS constant. An
+# earlier version imported it, which made this whole block fail and quietly
+# swapped the real BNO085 for the mock.
 try:
     import board, busio
     from adafruit_bno08x import (
         BNO_REPORT_ROTATION_VECTOR,
-        BNO_REPORT_GYROSCOPE,
-        BNO_REPORT_CALIBRATION_STATUS,
+        BNO_REPORT_MAGNETOMETER,
     )
     from adafruit_bno08x.i2c import BNO08X_I2C
     BNO_AVAILABLE = True
-except ImportError:
-    print("[WARN] adafruit-circuitpython-bno08x not found, BNO085 will use mock")
+    BNO_IMPORT_ERR = None
+except Exception as e:   # Blinka raises NotImplementedError/RuntimeError on
+                         # unsupported boards, not just ImportError
     BNO_AVAILABLE = False
+    BNO_IMPORT_ERR = e
 
 try:
     import icm20948
+    from smbus2 import SMBus
     ICM_AVAILABLE = True
-except ImportError:
-    print("[WARN] icm20948 not found, ICM-20948 will use mock")
+    ICM_IMPORT_ERR = None
+except Exception as e:
     ICM_AVAILABLE = False
+    ICM_IMPORT_ERR = e
 
 try:
     import ms5837
     DEPTH_AVAILABLE = True
-except ImportError:
-    print("[WARN] ms5837 not found, Bar10 will use mock")
+    DEPTH_IMPORT_ERR = None
+except Exception as e:
     DEPTH_AVAILABLE = False
+    DEPTH_IMPORT_ERR = e
 
 try:
     import serial
@@ -74,19 +92,28 @@ DEPTH_Q_POS  = 1e-4
 DEPTH_Q_VEL  = 1e-2
 DEPTH_R_MEAS = 1e-3
 
-MAG_CAL_MIN     = 2      # BNO085 calibration_status level needed to trust yaw
+MAG_CAL_MIN     = 2      # BNO085 mag accuracy level (0-3) needed to trust yaw
 MAG_CAL_TIMEOUT = 30.0   # if mag is still uncalibrated after this long, trust it
 MAG_CAL_R_MULT  = 25.0   # anyway rather than let yaw drift forever - inflate R instead
+MAG_UNTRUSTED_R_MULT = 1e6   # before the timeout: yaw R this large = yaw ignored
 WATCHDOG_DEG  = 15.0
 WATCHDOG_TIME = 3.0
 
-BNO_RATE_HZ   = 50
-ICM_RATE_HZ   = 200
-DEPTH_RATE_HZ = 20
-DEPTH_MAX_AGE = 1.0   # seconds - older than this, stop trusting depth for Vz blend
+BNO_RATE_HZ     = 50
+BNO_MAG_RATE_HZ = 10    # mag report only needed for its accuracy field
+ICM_RATE_HZ     = 200
+DEPTH_RATE_HZ   = 20
+DEPTH_MAX_AGE   = 1.0   # seconds - older than this, stop trusting depth for Vz blend
 
-BIAS_FILE  = "imu_bias.json"
-ALIGN_FILE = "imu_align.json"
+# the STM32 packet has no calibration field, so yaw is trusted from the start
+STM32_MAG_CAL = 3
+
+GRAVITY = 9.81
+CF_TAU  = 1.0   # complementary filter time constant, s (0.98 at 50 Hz)
+
+BIAS_FILE      = "imu_bias.json"
+BIAS_FILE_MOCK = "imu_bias_mock.json"   # keep mock runs away from the real file
+ALIGN_FILE     = "imu_align.json"
 
 
 # quaternion helpers
@@ -113,6 +140,23 @@ def angle_between(q1, q2):
     dot = abs(sum(a*b for a,b in zip(q1, q2)))
     return math.degrees(2.0 * math.acos(min(1.0, dot)))
 
+def wrap180(deg):
+    return ((deg + 180.0) % 360.0) - 180.0
+
+def rotmat(q):
+    """Body -> world rotation matrix for q = [w, x, y, z]."""
+    w,x,y,z = q
+    return np.array([
+        [1-2*(y*y+z*z), 2*(x*y-w*z),   2*(x*z+w*y)],
+        [2*(x*y+w*z),   1-2*(x*x+z*z), 2*(y*z-w*x)],
+        [2*(x*z-w*y),   2*(y*z+w*x),   1-2*(x*x+y*y)],
+    ])
+
+def skew(v):
+    return np.array([[ 0,   -v[2],  v[1]],
+                     [ v[2],  0,   -v[0]],
+                     [-v[1], v[0],  0   ]])
+
 
 # Error-state KF for attitude: state = quaternion + gyro bias.
 # predict() runs off the ICM gyro at ~200Hz, correct() pulls it back to the
@@ -120,13 +164,18 @@ def angle_between(q1, q2):
 
 class ESKF:
 
-    def __init__(self):
+    def __init__(self, estimate_bias=True):
         self.q  = np.array([1., 0., 0., 0.])
         self.b  = np.zeros(3)   # rad/s
         self.P  = np.diag([P0_ROT]*3 + [P0_BIAS]*3).astype(float)
         self._lock = threading.Lock()
         self._last_t = None
         self._ready  = False
+
+        # False = keep the bias fixed at its starting value (zero, or whatever
+        # was loaded). Only there so the benefit of bias estimation can be
+        # measured with everything else identical (--freeze-bias)
+        self.estimate_bias = estimate_bias
 
         # how long mag_cal has been below MAG_CAL_MIN - if it never comes up
         # (thrusters running, hull steel nearby, whatever) we can't just leave
@@ -200,24 +249,31 @@ class ESKF:
             if np.dot(self.q, bno_q) < 0:
                 bno_q = -bno_q
 
-            trust_yaw, r_yaw_mult = self._yaw_trust(mag_cal, t)
-            if not trust_yaw:
-                # ignore yaw entirely while mag is uncalibrated - overwrite the
-                # measurement's yaw with our own so the innovation carries no
-                # yaw info (roll/pitch still correct normally)
-                b_r, b_p, _ = to_euler(bno_q.tolist())
-                _, _, c_y   = to_euler(self.q.tolist())
-                bno_q = np.array(from_euler(b_r, b_p, c_y))
-                if np.dot(self.q, bno_q) < 0:
-                    bno_q = -bno_q
-
             q_err = self._qnorm(self._qmul(self._qconj(self.q), bno_q))
-            innov = 2.0 * q_err[1:]
+            innov = 2.0 * q_err[1:]   # small-angle error, body frame
 
             H = np.zeros((3,6)); H[:,:3] = np.eye(3)
-            R = np.diag([R_MEAS, R_MEAS, R_MEAS * r_yaw_mult])
+
+            # Down-weight yaw while the magnetometer can't be trusted. Yaw is a
+            # rotation about world up, and this error state lives in the body
+            # frame, so the yaw direction here is world-z seen from the body
+            # (C^T z). Inflate R along that direction only; roll and pitch keep
+            # their normal weight. Body z would only be right when level.
+            #
+            # An earlier version replaced the measured yaw with the filter's own
+            # yaw instead. The update then still counted it as a good
+            # measurement, so yaw uncertainty kept shrinking while the real yaw
+            # drifted (simulated: reported 0.4 deg sigma, actual error 8 deg).
+            R = np.eye(3) * R_MEAS
+            yaw_mult = self._yaw_r_mult(mag_cal, t)
+            if yaw_mult != 1.0:
+                u = self._world_up_in_body()
+                R += (yaw_mult - 1.0) * R_MEAS * np.outer(u, u)
+
             S = H @ self.P @ H.T + R
             K = self.P @ H.T @ np.linalg.inv(S)
+            if not self.estimate_bias:
+                K[3:, :] = 0.0
 
             dx = K @ innov
             dφ, db = dx[:3], dx[3:]
@@ -226,13 +282,22 @@ class ESKF:
             self.q = self._qnorm(self._qmul(self.q, dq))
             self.b += db
 
-            # joseph form
+            # joseph form (valid for any K, including the frozen-bias one)
             IKH = np.eye(6) - K @ H
             self.P = IKH @ self.P @ IKH.T + K @ R @ K.T
 
-    def _yaw_trust(self, mag_cal, t):
+            # reset step: the error is now folded into q, so re-express P
+            # about the new nominal attitude. Tiny effect at 50 Hz, but cheap
+            G = np.eye(6)
+            G[:3, :3] = np.eye(3) - skew(0.5 * dφ)
+            self.P = G @ self.P @ G.T
+
+    def _world_up_in_body(self):
+        return rotmat(self.q)[2, :]    # third row of C = C^T [0,0,1]
+
+    def _yaw_r_mult(self, mag_cal, t):
         """
-        Whether to trust BNO yaw this cycle, and what R multiplier to use.
+        R multiplier for the yaw direction this cycle.
         Normally we just wait for MAG_CAL_MIN. But an ROV with thrusters and a
         steel-ish frame near the compass can sit uncalibrated indefinitely, and
         the yaw gyro bias is only observable through this correction - so past
@@ -244,7 +309,7 @@ class ESKF:
             if self._mag_forced_ok:
                 print("\n[INFO] mag calibration recovered, yaw trust back to normal")
                 self._mag_forced_ok = False
-            return True, 1.0
+            return 1.0
 
         if self._mag_bad_since is None:
             self._mag_bad_since = t
@@ -254,16 +319,20 @@ class ESKF:
                 self._mag_forced_ok = True
                 print(f"\n\033[33m[WARN] mag uncalibrated for >{MAG_CAL_TIMEOUT:.0f}s, "
                       f"trusting yaw anyway (inflated R)\033[0m")
-            return True, MAG_CAL_R_MULT
+            return MAG_CAL_R_MULT
 
-        return False, 1.0
+        return MAG_UNTRUSTED_R_MULT
 
     def snapshot(self):
+        """(q, bias deg/s, trace P, yaw 1-sigma deg)"""
         with self._lock:
+            u = self._world_up_in_body()
+            yaw_var = float(u @ self.P[:3, :3] @ u)
             return (
                 [float(x) for x in self.q],
                 [float(x) for x in np.degrees(self.b)],
                 float(np.trace(self.P)),
+                math.degrees(math.sqrt(max(yaw_var, 0.0))),
             )
 
     def get_bias_rad(self):
@@ -318,12 +387,15 @@ class Watchdog:
         return div, self.triggered
 
 
-# Naive gyro+BNO complementary filter, kept purely as a baseline to show the
-# ESKF is actually worth the extra complexity. Not used for anything downstream.
+# Gyro+BNO complementary filter, kept purely as a baseline. Not used for
+# anything downstream. It is a fair version of the simple approach: body rates
+# are converted to Euler angle rates properly and the blend is set by a time
+# constant, so it behaves the same at any loop rate. What it can't do is learn
+# the gyro bias, which is exactly the thing the comparison is meant to isolate.
 
 class ComplementaryFilter:
 
-    ALPHA = 0.98  # weight on gyro integration between BNO updates
+    TAU = CF_TAU  # seconds
 
     def __init__(self):
         self.roll = self.pitch = self.yaw = 0.0
@@ -342,17 +414,29 @@ class ComplementaryFilter:
         if dt <= 0 or dt > 0.5:
             return self.roll, self.pitch, self.yaw
 
-        self.roll  = self._step(self.roll,  gyro_dps[0], bno_rpy[0], dt)
-        self.pitch = self._step(self.pitch, gyro_dps[1], bno_rpy[1], dt)
-        self.yaw   = self._step(self.yaw,   gyro_dps[2], bno_rpy[2], dt)
+        # body rates -> ZYX Euler angle rates (singular at pitch = +-90 deg)
+        p_, q_, r_ = gyro_dps
+        phi, th = math.radians(self.roll), math.radians(self.pitch)
+        cth = math.cos(th)
+        if abs(cth) < 1e-3:
+            cth = math.copysign(1e-3, cth)
+        k = q_*math.sin(phi) + r_*math.cos(phi)
+        droll  = p_ + k * math.sin(th) / cth
+        dpitch = q_*math.cos(phi) - r_*math.sin(phi)
+        dyaw   = k / cth
+
+        alpha = self.TAU / (self.TAU + dt)
+        self.roll  = self._step(self.roll,  droll,  bno_rpy[0], dt, alpha)
+        self.pitch = self._step(self.pitch, dpitch, bno_rpy[1], dt, alpha)
+        self.yaw   = self._step(self.yaw,   dyaw,   bno_rpy[2], dt, alpha)
         return self.roll, self.pitch, self.yaw
 
-    @classmethod
-    def _step(cls, angle, rate_dps, measured_deg, dt):
+    @staticmethod
+    def _step(angle, rate_dps, measured_deg, dt, alpha):
         predicted = angle + rate_dps * dt
         # shortest-path angle diff so this doesn't break across the +-180 wrap
-        diff = ((measured_deg - predicted + 180) % 360) - 180
-        return predicted + (1 - cls.ALPHA) * diff
+        diff = wrap180(measured_deg - predicted)
+        return wrap180(predicted + (1 - alpha) * diff)
 
 
 class DepthFilter:
@@ -421,9 +505,11 @@ class StateVector:
     """
     6-DOF state [vx,vy,vz,p,q,r] for the thruster allocator.
     vx/vy drift since we've got no horizontal reference, vz blended with depth.
+    Velocities are world frame with z up, so vz > 0 means rising. Accel must
+    be in m/s^2, and vz_depth must already be up-positive (see main()).
     """
 
-    GRAVITY     = 9.81
+    GRAVITY     = GRAVITY
     LEAK        = 0.995
     ACCEL_DEAD  = 0.05
     DEPTH_BLEND = 0.95    # 0=accel only, 1=depth only
@@ -558,20 +644,21 @@ class DepthThread(threading.Thread):
                 time.sleep(sleep)
 
 
-def save_bias(bias_rad):
+def save_bias(bias_rad, path):
     try:
         json.dump({"bias_rad_per_s": [float(x) for x in bias_rad]},
-                  open(BIAS_FILE, "w"), indent=2)
-        print(f"[INFO] bias saved: {np.degrees(np.array(bias_rad)).round(3)} deg/s")
+                  open(path, "w"), indent=2)
+        print(f"[INFO] bias saved to {path}: "
+              f"{np.degrees(np.array(bias_rad)).round(3)} deg/s")
     except Exception as e:
         print(f"[WARN] couldn't save bias: {e}")
 
-def load_bias_file():
-    if not os.path.exists(BIAS_FILE):
+def load_bias_file(path):
+    if not os.path.exists(path):
         return None
     try:
-        b = np.array(json.load(open(BIAS_FILE))["bias_rad_per_s"])
-        print(f"[INFO] loaded bias: {np.degrees(b).round(3)} deg/s")
+        b = np.array(json.load(open(path))["bias_rad_per_s"])
+        print(f"[INFO] loaded bias from {path}: {np.degrees(b).round(3)} deg/s")
         return b
     except Exception as e:
         print(f"[WARN] couldn't load bias: {e}")
@@ -582,27 +669,29 @@ class BNO085:
     def __init__(self, hz=BNO_RATE_HZ):
         i2c = busio.I2C(board.SCL, board.SDA)
         self.dev = BNO08X_I2C(i2c, address=BNO085_ADDR)
-        interval = int(1_000_000 / hz)
-        self.dev.enable_feature(BNO_REPORT_ROTATION_VECTOR, report_interval=interval)
-        self.dev.enable_feature(BNO_REPORT_GYROSCOPE,       report_interval=interval)
-        self.dev.enable_feature(BNO_REPORT_CALIBRATION_STATUS)
+        self.dev.enable_feature(BNO_REPORT_ROTATION_VECTOR,
+                                report_interval=int(1_000_000 / hz))
+        # the library only updates its mag accuracy value when a magnetometer
+        # report arrives, so this has to be on or accuracy reads 0 forever
+        self.dev.enable_feature(BNO_REPORT_MAGNETOMETER,
+                                report_interval=int(1_000_000 / BNO_MAG_RATE_HZ))
         self._warned = False
         print(f"[OK] BNO085 @ 0x{BNO085_ADDR:02X}, {hz}Hz")
 
     def read(self):
         try:
-            q = self.dev.quaternion
+            q = self.dev.quaternion          # library order is (i, j, k, real)
             if q is None:
                 return None, None
             qx, qy, qz, qw = q
-            try:
-                cal = self.dev.calibration_status
-                cs  = {"accel": cal[0] if cal else 0,
-                       "gyro":  cal[1] if cal else 0,
-                       "mag":   cal[2] if cal else 0}
-            except Exception:
-                cs = {"accel": 0, "gyro": 0, "mag": 0}
-            return [qw, qx, qy, qz], cs
+            # The public calibration_status property returns a single int (mag
+            # accuracy 0-3), not a tuple, and it sends a command to the chip and
+            # waits up to 2 s for the reply on every call. The value it returns
+            # is just the accuracy field of the latest magnetometer report, so
+            # read that directly instead.
+            mag = int(getattr(self.dev, "_magnetometer_accuracy", 0))
+            # accel/gyro calibration aren't read; -1 marks "unknown" in the log
+            return [qw, qx, qy, qz], {"accel": -1, "gyro": -1, "mag": mag}
         except Exception as e:
             if not self._warned:
                 print(f"[WARN] BNO085 read error: {e}")
@@ -611,44 +700,53 @@ class BNO085:
 
 
 class ICM20948:
-    def __init__(self):
-        self.dev    = icm20948.ICM20948(i2c_addr=ICM20948_ADDR)
-        self._scale = None   # set on first read
-        print(f"[OK] ICM-20948 @ 0x{ICM20948_ADDR:02X}")
+    def __init__(self, i2c_bus=1):
+        self.dev = icm20948.ICM20948(i2c_addr=ICM20948_ADDR, i2c_bus=SMBus(i2c_bus))
+        self._warned = False
+        print(f"[OK] ICM-20948 @ 0x{ICM20948_ADDR:02X} on bus {i2c_bus}")
 
     def read(self):
         try:
             ax, ay, az, gx, gy, gz = self.dev.read_accelerometer_gyro_data()
-
-            # some versions of the lib return rad/s, some deg/s. stationary gyro
-            # should be tiny either way so just look at the magnitude
-            if self._scale is None:
-                mag = math.sqrt(gx*gx + gy*gy + gz*gz)
-                if mag > 1e-6:
-                    if mag < 0.5:
-                        self._scale = math.degrees(1.0)
-                        print(f"[INFO] ICM gyro in rad/s, converting")
-                    else:
-                        self._scale = 1.0
-                        print(f"[INFO] ICM gyro in deg/s")
-                else:
-                    return None
-
-            return ax, ay, az, gx*self._scale, gy*self._scale, gz*self._scale
+            # pimoroni icm20948 returns accel in g and gyro in deg/s (checked in
+            # the library source). Everything downstream wants m/s^2. An earlier
+            # version guessed the gyro unit from the first reading's size, which
+            # could pick the wrong unit if the vehicle was nearly still.
+            return ax*GRAVITY, ay*GRAVITY, az*GRAVITY, gx, gy, gz
         except Exception as e:
-            print(f"[WARN] ICM-20948 read error: {e}")
+            if not self._warned:
+                print(f"[WARN] ICM-20948 read error: {e}")
+                self._warned = True
             return None
 
 
 class MockBNO085:
-    def __init__(self, hz=BNO_RATE_HZ):
+    """
+    Noise-free by default, so results against it are a best case.
+    mag_delay: seconds until mag accuracy reaches MAG_CAL_MIN (set it above
+    MAG_CAL_TIMEOUT to exercise the timeout path).
+    noise_deg: optional 1-sigma noise added to each Euler angle.
+    """
+    def __init__(self, hz=BNO_RATE_HZ, mag_delay=4.0, noise_deg=0.0):
         self._t0 = time.monotonic()
-        print("[MOCK] BNO085")
+        self._mag_delay = mag_delay
+        self._noise = noise_deg
+        print(f"[MOCK] BNO085 (mag ready after {mag_delay:.0f}s, "
+              f"noise {noise_deg} deg)")
 
     def read(self):
+        import random
         t = time.monotonic() - self._t0
-        q = from_euler(15*math.sin(0.3*t), 10*math.sin(0.2*t+0.5), 30*math.sin(0.1*t))
-        return q, {"accel": 3, "gyro": 3, "mag": min(3, int(t/2))}
+        r, p, y = 15*math.sin(0.3*t), 10*math.sin(0.2*t+0.5), 30*math.sin(0.1*t)
+        if self._noise > 0:
+            r += random.gauss(0, self._noise)
+            p += random.gauss(0, self._noise)
+            y += random.gauss(0, self._noise)
+        if self._mag_delay <= 0:
+            mag = 3
+        else:
+            mag = min(3, int(MAG_CAL_MIN * t / self._mag_delay))
+        return from_euler(r, p, y), {"accel": 3, "gyro": 3, "mag": mag}
 
 
 class MockICM20948:
@@ -667,7 +765,7 @@ class MockICM20948:
         pitch = 10*math.sin(0.2*t+0.5)
         r, p = math.radians(roll), math.radians(pitch)
 
-        g = 9.81
+        g = GRAVITY
         ax = -math.sin(p)              * g + random.gauss(0, 0.05)
         ay =  math.cos(p) * math.sin(r) * g + random.gauss(0, 0.05)
         az =  math.cos(p) * math.cos(r) * g + random.gauss(0, 0.05)
@@ -692,6 +790,13 @@ class STM32Reader:
     """
     Alternative to direct I2C. STM32 bridges the sensors to the Jetson over UART.
     Packet: IMU,qw,qx,qy,qz,ax,ay,az,gx,gy,gz[,depth_m]\\n
+    Units expected from the firmware: accel m/s^2, gyro deg/s, depth m.
+
+    One background thread owns the serial port and parses every line. The
+    read_* methods hand out the latest packet, and each returns None if no new
+    packet has arrived since that same method last returned data. An earlier
+    version had the BNO and ICM threads both calling readline() on the same
+    port, which split lines between them and fed stale values to predict().
     """
 
     HEADER       = "IMU"
@@ -702,52 +807,91 @@ class STM32Reader:
         if not SERIAL_AVAILABLE:
             raise RuntimeError("pyserial not installed - pip3 install pyserial")
         self._ser = serial.Serial(port, baudrate=baud, timeout=timeout)
-        self._qw = 1.0; self._qx = self._qy = self._qz = 0.0
-        self._ax = 0.0; self._ay = 0.0; self._az = 9.81
-        self._gx = self._gy = self._gz = 0.0
-        self._depth_m = 0.0
-        self._has_depth = False
+        self._lock = threading.Lock()
+        self._q     = [1.0, 0.0, 0.0, 0.0]
+        self._accel = (0.0, 0.0, GRAVITY)
+        self._gyro  = (0.0, 0.0, 0.0)
+        self._depth_m = None
+        self._seq = 0          # bumps on every good packet
+        self._depth_seq = 0    # bumps on every good packet that carried depth
+        self._seen = {"bno": 0, "icm": 0, "depth": 0}
         self._good_packets = 0
         self._bad_packets  = 0
+        self._halt = threading.Event()
         self._ser.reset_input_buffer()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="STM32")
+        self._thread.start()
         print(f"[OK] STM32 on {port} @ {baud} baud")
+        print("[WARN] STM32 packets carry no mag calibration, "
+              "yaw is trusted from the start")
+
+    def _run(self):
+        while not self._halt.is_set():
+            self._poll()
 
     def _poll(self):
         try:
             raw = self._ser.readline()
             if not raw:
-                return False
+                return
             parts = raw.decode("ascii", errors="replace").strip().split(",")
             if parts[0] != self.HEADER or len(parts) not in (self.FIELDS, self.FIELDS_DEPTH):
-                self._bad_packets += 1
-                return False
+                with self._lock:
+                    self._bad_packets += 1
+                return
             vals = [float(p) for p in parts[1:]]
-            self._qw, self._qx, self._qy, self._qz = vals[0:4]
-            self._ax, self._ay, self._az           = vals[4:7]
-            self._gx, self._gy, self._gz           = vals[7:10]
-            if len(parts) == self.FIELDS_DEPTH:
-                self._depth_m   = vals[10]
-                self._has_depth = True
-            self._good_packets += 1
-            return True
         except (ValueError, UnicodeDecodeError):
-            self._bad_packets += 1
+            with self._lock:
+                self._bad_packets += 1
+            return
+        except Exception as e:     # port unplugged etc.
+            print(f"[WARN] STM32 read error: {e}")
+            time.sleep(0.1)
+            return
+
+        with self._lock:
+            self._q     = vals[0:4]
+            self._accel = tuple(vals[4:7])
+            self._gyro  = tuple(vals[7:10])
+            self._seq  += 1
+            if len(parts) == self.FIELDS_DEPTH:
+                self._depth_m = vals[10]
+                self._depth_seq += 1
+            self._good_packets += 1
+
+    def _take(self, key, seq):
+        """True if there's a packet this reader hasn't had yet."""
+        if seq == self._seen[key]:
             return False
+        self._seen[key] = seq
+        return True
 
     def read_bno(self):
-        self._poll()
-        # no real cal status from stm32, just assume all good
-        cal = {"accel": 3, "gyro": 3, "mag": 3}
-        return [self._qw, self._qx, self._qy, self._qz], cal
+        with self._lock:
+            if not self._take("bno", self._seq):
+                return None, None
+            q = list(self._q)
+        return q, {"accel": -1, "gyro": -1, "mag": STM32_MAG_CAL}
 
     def read_icm(self):
-        self._poll()
-        return self._ax, self._ay, self._az, self._gx, self._gy, self._gz
+        with self._lock:
+            if not self._take("icm", self._seq):
+                return None
+            return self._accel + self._gyro
 
     def read_depth(self):
-        if not self._has_depth:
-            return None
-        return self._depth_m
+        with self._lock:
+            if self._depth_m is None or not self._take("depth", self._depth_seq):
+                return None
+            return self._depth_m
+
+    def stop(self):
+        self._halt.set()
+        self._thread.join(timeout=1.0)
+        try:
+            self._ser.close()
+        except Exception:
+            pass
 
 
 class PredictThread(threading.Thread):
@@ -761,7 +905,7 @@ class PredictThread(threading.Thread):
         self._dt      = 1.0 / hz
         self._halt  = threading.Event()
         self._gyro  = (0., 0., 0.)
-        self._accel = (0., 0., 9.81)
+        self._accel = (0., 0., GRAVITY)
         self._glock = threading.Lock()
 
     def last_gyro(self):
@@ -813,7 +957,8 @@ FIELDS = [
     "fused_qw", "fused_qx", "fused_qy", "fused_qz",
     "bias_x", "bias_y", "bias_z",
     "err_roll", "err_pitch", "err_yaw",
-    "yaw_ok", "P_trace", "divergence", "watchdog",
+    "pred_err_roll", "pred_err_pitch", "pred_err_yaw",
+    "yaw_ok", "P_trace", "yaw_sigma_deg", "divergence", "watchdog",
     "depth_raw_m", "depth_m", "vz_m_per_s",
     "sv_vx", "sv_vy", "sv_vz", "sv_p", "sv_q", "sv_r",
 ]
@@ -826,7 +971,7 @@ def open_log(path):
 
 
 def show(bno_rpy, fused_rpy, bias, cal, yaw_ok, div, wd, P, t, skipped):
-    err = tuple(f-b for f,b in zip(fused_rpy, bno_rpy))
+    err = tuple(wrap180(f-b) for f,b in zip(fused_rpy, bno_rpy))
     ec  = "\033[31m" if any(abs(e) > 2 for e in err) else "\033[90m"
     wc  = "\033[31m" if wd else "\033[90m"
     yc  = "\033[32m" if yaw_ok else "\033[33m"
@@ -889,8 +1034,8 @@ def make_plot(csv_path, out_path):
     BIAS_C = "#ff9800"
     EKF_C  = "#a259ff"
     ERR_C  = "#ff4444"
-    LIN_C  = "#00e676"  # linear velocity — green
-    ANG_C  = "#ff6d00"  # angular rate — orange
+    LIN_C  = "#00e676"  # linear velocity - green
+    ANG_C  = "#ff6d00"  # angular rate - orange
     BG     = "#1a1d27"
 
     # 4 columns: sources / divergence / EKF residual+bias / state vector
@@ -903,7 +1048,8 @@ def make_plot(csv_path, out_path):
     fig_h = 4 * nrows - 1
     fig = plt.figure(figsize=(6 * ncols, fig_h))
     fig.patch.set_facecolor("#0f1117")
-    gs = gridspec.GridSpec(nrows, ncols, figure=fig, hspace=0.55, wspace=0.32)
+    gs = gridspec.GridSpec(nrows, ncols, figure=fig, hspace=0.55, wspace=0.32,
+                           top=0.95)
 
     def ax_style(ax, title, ylabel="deg"):
         ax.set_facecolor(BG)
@@ -937,7 +1083,7 @@ def make_plot(csv_path, out_path):
             ax0.fill_between(ts, bno_cols[i].min()-5, bno_cols[i].max()+5,
                              where=(yaw_ok<0.5), alpha=0.1, color="#ff9800",
                              label="mag warming up")
-        ax_style(ax0, f"{label} — All Sources" if has_cf else f"{label} — BNO085 vs ESKF")
+        ax_style(ax0, f"{label}: All Sources" if has_cf else f"{label}: BNO085 vs ESKF")
         ax0.legend(fontsize=7, facecolor=BG, edgecolor="#444", labelcolor="white")
 
         ax1 = fig.add_subplot(gs[i, 1])
@@ -960,7 +1106,7 @@ def make_plot(csv_path, out_path):
             ax2 = fig.add_subplot(gs[i, 2])
             ax2.plot(ts, sv_lin[i], LIN_C, lw=1.3, label=f"v{'xyz'[i]} (m/s)")
             ax2.axhline(0, color="#555566", lw=0.6, ls=":")
-            ax_style(ax2, f"State — {label} axis", ylabel="lin vel (m/s)")
+            ax_style(ax2, f"State: {label} axis", ylabel="lin vel (m/s)")
             ax2t = ax2.twinx()
             ax2t.plot(ts, sv_ang[i], ANG_C, lw=1.0, ls="--",
                       label=f"{'pqr'[i]} (deg/s)")
@@ -1018,7 +1164,7 @@ def make_plot(csv_path, out_path):
             ax_p2.semilogy(ts, P_trace, "#a259ff", lw=1.2)
             ax_style(ax_p2, "EKF covariance trace Tr(P) log", ylabel="Tr(P)")
 
-    fig.suptitle("Hydrobotics ROV — IMU fusion (ESKF, full pipeline)",
+    fig.suptitle("Hydrobotics ROV: IMU fusion (ESKF, full pipeline)",
                  color="white", fontsize=13, fontweight="bold", y=0.998)
     subtitle_bits = [
         f"BNO085 @ {BNO_RATE_HZ}Hz",
@@ -1055,15 +1201,37 @@ def get_args():
                    help="Use STM32 UART instead of I2C (e.g. /dev/ttyUSB0 or COM3)")
     p.add_argument("--stm32-baud",   type=int, default=115200,
                    help="STM32 UART baud rate (default 115200)")
+    p.add_argument("--freeze-bias",  action="store_true",
+                   help="don't estimate gyro bias (for comparison runs)")
+    p.add_argument("--mock-mag-delay", type=float, default=4.0,
+                   help="mock only: seconds until mag calibration is trusted "
+                        f"(above {MAG_CAL_TIMEOUT:.0f} tests the timeout path)")
+    p.add_argument("--mock-bno-noise", type=float, default=0.0,
+                   help="mock only: 1-sigma noise on BNO085 angles, deg")
     return p.parse_args()
+
+
+def require_hw(name, available, err, mock):
+    """Use a mock only when asked. Otherwise a missing library is fatal."""
+    if mock:
+        return False
+    if not available:
+        print(f"[FATAL] {name} library unavailable ({err}). "
+              f"Install it, or run with --mock to use simulated sensors.")
+        sys.exit(1)
+    return True
 
 
 # --- main ---
 
 def main():
     args = get_args()
-    mock = args.mock or _FORCE_MOCK
+    # STM32 over UART is real data even on Windows, so it overrides mock mode
+    mock = (args.mock or _FORCE_MOCK) and not args.stm32
+    if _FORCE_MOCK and not args.mock and not args.stm32:
+        print("[INFO] Windows: no I2C stack, using simulated sensors")
 
+    stm = None
     if args.stm32:
         try:
             stm = STM32Reader(args.stm32, baud=args.stm32_baud)
@@ -1078,20 +1246,28 @@ def main():
             bno = _BnoShim()
             icm = _IcmShim()
             # can't know at init time whether the firmware will ever send a
-            # depth field (stm._has_depth only flips true after a packet with
-            # one actually arrives), so always wire the shim up - DepthFilter.
-            # is_fresh() is what decides whether we actually trust it later
+            # depth field, so always wire the shim up - DepthFilter.is_fresh()
+            # is what decides whether we actually trust it later
             depth_source_override = _DepthShim()
         except Exception as e:
             print(f"[FATAL] STM32 init failed: {e}")
             sys.exit(1)
     else:
-        bno = MockBNO085(args.bno_rate)   if (mock or not BNO_AVAILABLE) else BNO085(args.bno_rate)
-        icm = MockICM20948()              if (mock or not ICM_AVAILABLE) else ICM20948()
+        if require_hw("BNO085 (adafruit-circuitpython-bno08x)", BNO_AVAILABLE,
+                      BNO_IMPORT_ERR, mock):
+            bno = BNO085(args.bno_rate)
+        else:
+            bno = MockBNO085(args.bno_rate, mag_delay=args.mock_mag_delay,
+                             noise_deg=args.mock_bno_noise)
+        if require_hw("ICM-20948 (icm20948, smbus2)", ICM_AVAILABLE,
+                      ICM_IMPORT_ERR, mock):
+            icm = ICM20948(args.i2c_bus)
+        else:
+            icm = MockICM20948()
         depth_source_override = None
 
     align    = Alignment()
-    ekf      = ESKF()
+    ekf      = ESKF(estimate_bias=not args.freeze_bias)
     watchdog = Watchdog()
     sv       = StateVector()
     cf       = ComplementaryFilter()
@@ -1100,16 +1276,26 @@ def main():
     depth_filter = DepthFilter()
     if not args.no_depth:
         try:
+            depth_sensor = None
             if depth_source_override is not None:
                 depth_sensor = depth_source_override
+            elif mock:
+                depth_sensor = MockBar10()
+            elif DEPTH_AVAILABLE:
+                depth_sensor = Bar10()
             else:
-                depth_sensor = (MockBar10() if (mock or not DEPTH_AVAILABLE) else Bar10())
-            depth_thread = DepthThread(depth_sensor, depth_filter, hz=args.depth_rate)
+                # depth is optional, so carry on without it - but never swap
+                # in the mock on real hardware
+                print(f"[WARN] ms5837 unavailable ({DEPTH_IMPORT_ERR}), "
+                      f"running without depth")
+            if depth_sensor is not None:
+                depth_thread = DepthThread(depth_sensor, depth_filter, hz=args.depth_rate)
         except Exception as e:
             print(f"[WARN] depth sensor init failed ({e}), continuing without")
 
+    bias_file = BIAS_FILE_MOCK if mock else BIAS_FILE
     if not args.no_bias_load:
-        b = load_bias_file()
+        b = load_bias_file(bias_file)
         if b is not None:
             ekf.load_bias(b)
 
@@ -1145,9 +1331,12 @@ def main():
 
             mag_cal = cal["mag"]
             yaw_ok  = mag_cal >= MAG_CAL_MIN
+            # attitude from the gyro-driven prediction alone, just before this
+            # correction: what the 200 Hz output looks like between BNO updates
+            pred_rpy = to_euler(ekf.snapshot()[0])
             ekf.correct(bno_q, mag_cal, t0)
 
-            fused_q, bias_dps, P_trace = ekf.snapshot()
+            fused_q, bias_dps, P_trace, yaw_sigma = ekf.snapshot()
             gx, gy, gz = predict_thread.last_gyro()
             ax, ay, az = predict_thread.last_accel()
             wx, wy, wz = predict_thread.get_angular_velocity()
@@ -1158,14 +1347,17 @@ def main():
             bno_rpy   = to_euler(bno_q)
             fused_rpy = to_euler(fused_q)
             cf_rpy    = cf.update(bno_rpy, (gx, gy, gz), t0)
-            err       = tuple(round(f-b, 4) for f,b in zip(fused_rpy, bno_rpy))
+            err       = tuple(round(wrap180(f-b), 4) for f,b in zip(fused_rpy, bno_rpy))
+            pred_err  = tuple(round(wrap180(f-b), 4) for f,b in zip(pred_rpy, bno_rpy))
             div, wd   = watchdog.check(fused_q, bno_q, t0)
 
             state = sv.update(
                 ax, ay, az,
                 fused_rpy[0], fused_rpy[1], fused_rpy[2],
                 wx, wy, wz,
-                vz_depth=vz if depth_fresh else None,
+                # depth KF Vz is d(depth)/dt, positive going down; the state
+                # vector is z-up, so flip it before blending
+                vz_depth=-vz if depth_fresh else None,
             )
 
             log_w.writerow({
@@ -1190,8 +1382,11 @@ def main():
                 "bias_y": round(bias_dps[1],5),
                 "bias_z": round(bias_dps[2],5),
                 "err_roll": err[0], "err_pitch": err[1], "err_yaw": err[2],
+                "pred_err_roll": pred_err[0], "pred_err_pitch": pred_err[1],
+                "pred_err_yaw": pred_err[2],
                 "yaw_ok":    int(yaw_ok),
                 "P_trace":   round(P_trace, 10),
+                "yaw_sigma_deg": round(yaw_sigma, 4),
                 "divergence": round(div, 4),
                 "watchdog":   int(wd),
                 "depth_raw_m": round(depth_raw, 4),
@@ -1219,11 +1414,13 @@ def main():
         if depth_thread:
             depth_thread.stop()
             depth_thread.join(timeout=2.0)
+        if stm is not None:
+            stm.stop()
         log_f.close()
         dur = time.monotonic() - t0_global
         print(f"\n\n[DONE] {n} samples in {dur:.1f}s ({n/dur:.1f}Hz)  skipped={skipped}")
-        if not args.no_bias_save:
-            save_bias(ekf.get_bias_rad())
+        if not args.no_bias_save and not args.freeze_bias:
+            save_bias(ekf.get_bias_rad(), bias_file)
 
     if args.plot:
         out = args.plot_out or args.log.replace(".csv", ".png")
